@@ -1,6 +1,5 @@
-# SAM: Sharpness-Aware Minimization for Efficiently Improving Generalization
+# SSAM: Second-Order Sharpness Aware Minimization
 
-by Pierre Foret, Ariel Kleiner, Hossein Mobahi and Behnam Neyshabur.
 
 
 ## SAM in a few words
