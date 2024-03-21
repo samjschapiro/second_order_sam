@@ -165,6 +165,8 @@ def main(_):
                                         local_batch_size, image_size,
                                         num_classes, num_channels)
 
+
+  #TODO: It seems all the training is abstracted away to here...
   # Learning rate will be overwritten by the lr schedule, we set it to zero.
   optimizer = flax_training.create_optimizer(model, 0.0)
 

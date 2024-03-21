@@ -36,9 +36,13 @@ from sam.sam_jax.datasets import dataset_source as dataset_source_lib
 from sam.sam_jax.efficientnet import optim as efficientnet_optim
 import tensorflow as tf
 from tensorflow.io import gfile
+import jaxopt as jo
+import optax
 
 
 FLAGS = flags.FLAGS
+
+# TODO: Seems most of the necessary edits can be made here
 
 
 # Training hyper-parameters
@@ -248,6 +252,7 @@ def cross_entropy_loss(logits: jnp.ndarray,
   return jnp.nan_to_num(loss)  # Set to zero if there is no non-masked samples.
 
 
+
 def error_rate_metric(logits: jnp.ndarray,
                       one_hot_labels: jnp.ndarray,
                       mask: Optional[jnp.ndarray] = None) -> jnp.ndarray:
@@ -299,35 +304,12 @@ def top_k_error_rate_metric(logits: jnp.ndarray,
 
 
 def tensorflow_to_numpy(xs):
-  """Converts a tree of tensorflow tensors to numpy arrays.
-
-  Args:
-    xs: A pytree (such as nested tuples, lists, and dicts) where the leaves are
-      tensorflow tensors.
-
-  Returns:
-    A pytree with the same structure as xs, where the leaves have been converted
-      to jax numpy ndarrays.
-  """
   # Use _numpy() for zero-copy conversion between TF and NumPy.
   xs = jax.tree_map(lambda x: x._numpy(), xs)  # pylint: disable=protected-access
   return xs
 
 
 def shard_batch(xs):
-  """Shards a batch across all available replicas.
-
-  Assumes that the number of samples (first dimension of xs) is divisible by the
-  number of available replicas.
-
-  Args:
-    xs: A pytree (such as nested tuples, lists, and dicts) where the leaves are
-      numpy ndarrays.
-
-  Returns:
-    A pytree with the same structure as xs, where the leaves where added a
-      leading dimension representing the replica the tensor is on.
-  """
   local_device_count = jax.local_device_count()
   def _prepare(x):
     return x.reshape((local_device_count, -1) + x.shape[1:])
@@ -335,16 +317,6 @@ def shard_batch(xs):
 
 
 def load_and_shard_tf_batch(xs):
-  """Converts to numpy arrays and distribute a tensorflow batch.
-
-  Args:
-    xs: A pytree (such as nested tuples, lists, and dicts) where the leaves are
-      tensorflow tensors.
-
-  Returns:
-    A pytree of numpy ndarrays with the same structure as xs, where the leaves
-      where added a leading dimension representing the replica the tensor is on.
-  """
   return shard_batch(tensorflow_to_numpy(xs))
 
 
@@ -353,19 +325,6 @@ def create_exponential_learning_rate_schedule(
     steps_per_epoch: int,
     lamba: float,
     warmup_epochs: int = 0) -> Callable[[int], float]:
-  """Creates a exponential learning rate schedule with optional warmup.
-
-  Args:
-    base_learning_rate: The base learning rate.
-    steps_per_epoch: The number of iterations per epoch.
-    lamba: Decay is v0 * exp(-t / lambda).
-    warmup_epochs: Number of warmup epoch. The learning rate will be modulated
-      by a linear function going from 0 initially to 1 after warmup_epochs
-      epochs.
-
-  Returns:
-    Function `f(step) -> lr` that computes the learning rate for a given step.
-  """
   def learning_rate_fn(step):
     t = step / steps_per_epoch
     return base_learning_rate * jnp.exp(-t / lamba) * jnp.minimum(
@@ -377,18 +336,6 @@ def create_exponential_learning_rate_schedule(
 def get_cosine_schedule(num_epochs: int, learning_rate: float,
                         num_training_obs: int,
                         batch_size: int) -> Callable[[int], float]:
-  """Returns a cosine learning rate schedule, without warm up.
-
-  Args:
-    num_epochs: Number of epochs the model will be trained for.
-    learning_rate: Initial learning rate.
-    num_training_obs: Number of training observations.
-    batch_size: Total batch size (number of samples seen per gradient step).
-
-  Returns:
-    A function that takes as input the current step and returns the learning
-      rate to use.
-  """
   steps_per_epoch = int(math.floor(num_training_obs / batch_size))
   learning_rate_fn = lr_schedule.create_cosine_learning_rate_schedule(
       learning_rate, steps_per_epoch // jax.host_count(), num_epochs,
@@ -399,18 +346,6 @@ def get_cosine_schedule(num_epochs: int, learning_rate: float,
 def get_exponential_schedule(num_epochs: int, learning_rate: float,
                              num_training_obs: int,
                              batch_size: int) -> Callable[[int], float]:
-  """Returns an exponential learning rate schedule, without warm up.
-
-  Args:
-    num_epochs: Number of epochs the model will be trained for.
-    learning_rate: Initial learning rate.
-    num_training_obs: Number of training observations.
-    batch_size: Total batch size (number of samples seen per gradient step).
-
-  Returns:
-    A function that takes as input the current step and returns the learning
-      rate to use.
-  """
   steps_per_epoch = int(math.floor(num_training_obs / batch_size))
   # At the end of the training, lr should be 1.2% of original value
   # This mimic the behavior from the efficientnet paper.
@@ -422,25 +357,13 @@ def get_exponential_schedule(num_epochs: int, learning_rate: float,
 
 
 def global_norm(updates) -> jnp.ndarray:
-  """Returns the l2 norm of the input.
-
-  Args:
-    updates: A pytree of ndarrays representing the gradient.
-  """
+  """Returns the l2 norm of the input."""
   return jnp.sqrt(
       sum([jnp.sum(jnp.square(x)) for x in jax.tree_leaves(updates)]))
 
 
 def clip_by_global_norm(updates):
   """Clips the gradient by global norm.
-
-  Will have no effect if FLAGS.gradient_clipping is set to zero (no clipping).
-
-  Args:
-    updates: A pytree of numpy ndarray representing the gradient.
-
-  Returns:
-    The gradient clipped by global norm.
   """
   if FLAGS.gradient_clipping > 0:
     g_norm = global_norm(updates)
@@ -453,16 +376,39 @@ def clip_by_global_norm(updates):
 
 def dual_vector(y: jnp.ndarray) -> jnp.ndarray:
   """Returns the solution of max_x y^T x s.t. ||x||_2 <= 1.
-
-  Args:
-    y: A pytree of numpy ndarray, vector y in the equation above.
   """
   gradient_norm = jnp.sqrt(sum(
       [jnp.sum(jnp.square(e)) for e in jax.tree_util.tree_leaves(y)]))
   normalized_gradient = jax.tree_map(lambda x: x / gradient_norm, y)
   return normalized_gradient
 
+# SSAM Stuff
 
+def get_ssam_gradient(params, x, y, n_iter, beta_start):
+    betas = beta_start
+    # SSAM objective function
+    def ssam_func(beta, params_, x_, y_):
+        # TODO: replace by forward and loss?
+        grads = grad(loss_by_params)(params_, x_, y_)
+        func_grads = grad(apply_model2)(params_, x_, y_)
+        return jnp.sum(jnp.array(jax.tree_util.tree_leaves(jax.tree_util.tree_map(lambda b, nabla_l, nabla_f: jnp.sum(-b*nabla_l - (b*nabla_f)**2), # MSE loss, so l_i'' is 1 #
+                                beta,
+                                grads,
+                                func_grads))))
+    pga = jo.ProjectedGradient(fun=ssam_func, projection=jo.projection.projection_l2_ball, stepsize=FLAGS.sam_rho/2, maxiter=n_iter)
+    beta_star, _ = pga.run(betas, hyperparams_proj=FLAGS.sam_rho, params_=params, x_=x, y_=y)
+    grad_location = jax.tree_util.tree_map(lambda p, b: p + b, 
+                              params, 
+                              beta_star)
+    # TODO: replace by sam_grad
+    grads = grad(loss_by_params)(grad_location, x, y)
+    return grads 
+
+
+# SSAM Stuff: End
+
+
+# TODO: Edit this
 def train_step(
     optimizer: flax.optim.Optimizer,
     state: flax.nn.Collection,
@@ -493,6 +439,7 @@ def train_step(
       a dictionary containing the training loss and error rate on the batch.
   """
 
+  # TODO: Edit this, possibly making a new version where l' = 1
   def forward_and_loss(model: flax.nn.Model, true_gradient: bool = False):
     """Returns the model's loss, updated state and predictions.
 
@@ -524,6 +471,7 @@ def train_step(
 
   step = optimizer.state.step
 
+  # TODO: Edit this
   def get_sam_gradient(model: flax.nn.Model, rho: float):
     """Returns the gradient of the SAM loss loss, updated state and logits.
 
@@ -698,6 +646,7 @@ _EMAUpdateStep = Callable[[
 ], efficientnet_optim.ExponentialMovingAverage]
 
 
+# TODO: edit this
 def train_for_one_epoch(
     dataset_source: dataset_source_lib.DatasetSource,
     optimizer: flax.optim.Optimizer, state: flax.nn.Collection,
@@ -760,6 +709,7 @@ def train_for_one_epoch(
   return optimizer, state, moving_averages
 
 
+# TODO: edit this
 def train(optimizer: flax.optim.Optimizer,
           state: flax.nn.Collection,
           dataset_source: dataset_source_lib.DatasetSource,
